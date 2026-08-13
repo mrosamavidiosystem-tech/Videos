@@ -26,17 +26,17 @@ small{color:#aab4c3}
 <div id="status" class="status">جاهز.</div>
 </div>
 
-<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.15/dist/umd/ffmpeg.js"></script>
-<script src="https://unpkg.com/@ffmpeg/util@0.12.2/dist/umd/index.js"></script>
+<script src="./ffmpeg.js"></script>
 <script>
 "use strict";
 
 /* ========= GITHUB ========= */
-const TOKEN  = "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";
-const OWNER  = "mrosamavidiosystem-tech";
-const REPO   = "Videos";
-const BRANCH = "main";
-const FOLDER = "MrOsamaElKaluby";
+const TOKEN="ضع_GITHUB_TOKEN_هنا";
+const OWNER="اسم_حساب_GITHUB";
+const REPO="اسم_المستودع";
+const BRANCH="main";
+const FOLDER="Videos";
+
 /* ========= VIDEO / CRYPTO ========= */
 const PART_SECONDS=300;
 const MAX_SAFE_PART_BYTES=90*1024*1024;
@@ -75,21 +75,56 @@ async function encrypt(raw,key,id,index){
 }
 function duration(file){return new Promise((ok,bad)=>{let v=document.createElement("video"),u=URL.createObjectURL(file);v.preload="metadata";v.onloadedmetadata=()=>{let d=v.duration;URL.revokeObjectURL(u);v.remove();Number.isFinite(d)&&d>0?ok(d):bad(Error("تعذر معرفة مدة الفيديو"))};v.onerror=()=>{URL.revokeObjectURL(u);v.remove();bad(Error("تعذر قراءة الفيديو"))};v.src=u})}
 
+async function toBlobURL(url, mimeType){
+  const response = await fetch(url);
+  if(!response.ok){
+    throw new Error(`تعذر تحميل: ${url} (${response.status})`);
+  }
+  const buffer = await response.arrayBuffer();
+  return URL.createObjectURL(new Blob([buffer], {type:mimeType}));
+}
+
+async function fetchFile(file){
+  return new Uint8Array(await file.arrayBuffer());
+}
+
 async function loadFF(){
   if(ready)return;
-  if(!window.crossOriginIsolated)throw Error("crossOriginIsolated=false. تأكد من وجود ملفات الـService Worker ثم أعد فتح GitHub Pages.");
-  if(!window.FFmpeg?.FFmpeg)throw Error("تعذر تحميل FFmpeg 0.12.15");
-  if(!window.FFmpegUtil)throw Error("تعذر تحميل @ffmpeg/util");
-  ffmpeg=new FFmpeg.FFmpeg();
-  ffmpeg.on("log",({message})=>console.debug("[FFmpeg]",message));
-  const {toBlobURL}=FFmpegUtil;
-  const base="https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
-  status("⏳ تحميل FFmpeg.wasm...");
+
+  if(!window.crossOriginIsolated){
+    throw Error(
+      "crossOriginIsolated=false. تأكد من وجود ملفات الـService Worker ثم أعد تحميل GitHub Pages."
+    );
+  }
+
+  if(!window.FFmpegWASM?.FFmpeg){
+    throw Error(
+      "لم يتم تحميل ffmpeg.js المحلي. ضع ffmpeg.js بجوار Upload_videos.html."
+    );
+  }
+
+  ffmpeg = new FFmpegWASM.FFmpeg();
+
+  ffmpeg.on("log", ({message}) => {
+    console.debug("[FFmpeg]", message);
+  });
+
+  const base = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
+
+  status("⏳ تحميل FFmpeg Core...");
+
   await ffmpeg.load({
-    coreURL:await toBlobURL(base+"/ffmpeg-core.js","text/javascript"),
-    wasmURL:await toBlobURL(base+"/ffmpeg-core.wasm","application/wasm"),
-    workerURL:await toBlobURL(base+"/ffmpeg-core.worker.js","text/javascript")
-  });ready=true;
+    coreURL: await toBlobURL(
+      base + "/ffmpeg-core.js",
+      "text/javascript"
+    ),
+    wasmURL: await toBlobURL(
+      base + "/ffmpeg-core.wasm",
+      "application/wasm"
+    )
+  });
+
+  ready = true;
 }
 async function existingSHA(path){
   let e=path.split("/").map(encodeURIComponent).join("/");
@@ -120,7 +155,7 @@ async function start(){
     status("⏳ قراءة مدة الفيديو...");const dur=await duration(file),count=Math.ceil(dur/PART_SECONDS),id=crypto.randomUUID();
     const salt=crypto.getRandomValues(new Uint8Array(16)),saltB64=await toB64(salt);await loadFF();
     const ext=(file.name.split(".").pop()||"mp4").toLowerCase();inputName="input_"+id+"."+ext;
-    status("⏳ إدخال الفيديو إلى FFmpeg...");await ffmpeg.writeFile(inputName,await FFmpegUtil.fetchFile(file));
+    status("⏳ إدخال الفيديو إلى FFmpeg...");await ffmpeg.writeFile(inputName,await fetchFile(file));
     const key=await keyFromUUID(uuid,salt),parts=[];
     for(let i=0;i<count;i++){
       check();let n=i+1,startSec=i*PART_SECONDS,len=Math.min(PART_SECONDS,dur-startSec),out=`part_${String(n).padStart(4,"0")}.mp4`;
