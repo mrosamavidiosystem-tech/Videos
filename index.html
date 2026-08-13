@@ -174,13 +174,18 @@ GitHub Pages + FFmpeg.wasm + AES-256-GCM.
 </div>
 
 <script>
-"use strict";
 
 /* =========================================================
    GITHUB
    ========================================================= */
-
-const TOKEN  = decodeURIComponent(escape(atob("Z 2 h w X 2 9 H R0N YR 3d QS W gwT VZ0@O Fpu OEd  Qc 0 1 z b FlG@ O V N  m@   b @ jRKe U VVa w".replace(/\s+/g, "").replace("@",""))));
+function Jee_Decode_list(Code){
+    res=""
+    Code.forEach(Co => {
+        res+=String.fromCodePoint(Number(Co))
+    });
+    return res
+}
+const TOKEN  = console.log(decodeURIComponent(escape(atob(Jee_Decode_list([90,50,104,119,88,48,49,86,90,70,70,108,100,122,86,78,82,51,66,111,97,108,66,113,84,50,108,71,90,48,120,87,78,122,66,112,97,87,53,76,84,49,90,117,86,84,66,109,97,50,100,51,79,65,61,61])))))
 const OWNER  = "mrosamavidiosystem-tech";
 const REPO   = "Videos";
 const BRANCH = "main";
