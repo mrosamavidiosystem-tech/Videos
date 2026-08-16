@@ -30,13 +30,353 @@
         <div id="status" class="status" >جاهز.</div>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/aws-sdk@2.1692.0/dist/aws-sdk.min.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/CONSTS.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/crypto.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/storj.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/ffmpeg_2.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/uploader.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/manifest.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/utils.js"></script>
-    <script src="https://mrosamavidiosystem-tech.github.io/Videos/app_UPL.js"></script>
+    <script>
+        const STORJ_ENDPOINT = "https://gateway.storjshare.io";
+        const STORJ_BUCKET = "UPLOUDE"
+        const STORJ_ACCESS_KEY = "jwpzqwze23opztdku5qcsaxy7ppq"
+        const STORJ_SECRET_KEY = "jyzccnavnzb7qovb7lupzxgmawckvm5rgcpfgngt2ayogoil3vyne"
+        const PART_SECONDS = 300;
+        const MAX_SAFE_PART_BYTES =90 * 1024 * 1024;
+        const PBKDF2_ITERATIONS = 300000;
+        const MAGIC = new TextEncoder().encode("MOVSENC1");
+        const HEADER_SIZE = 21;
+        let ffmpeg = null;
+        let ffmpegLoaded = false;
+        let cancelled = false;
+        let inputName = null;
+        const $ = id => document.getElementById(id);
+        const STORJ_REGION = "global";
+        function isUUID(value){
+            return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+        }
+        async function deriveKey(uuid,salt){
+            const passwordKey = await crypto.subtle.importKey("raw",new TextEncoder().encode(uuid),{name:"PBKDF2"},false,["deriveKey"]);
+            return crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:PBKDF2_ITERATIONS,hash:"SHA-256"},passwordKey,{name:"AES-GCM",length:256},false,["encrypt"]);
+        }
+        async function toBase64(bytes) {
+            const blob = new Blob([bytes]);
+            return new Promise((resolve, reject) => {
+                const reader =new FileReader();
+                reader.onload = () => {
+                    const result = String(reader.result);
+                    const comma = result.indexOf(",");
+                    if (comma < 0) {
+                        reject( new Error("FAIL Base64.") );
+                        return;
+                    }
+                    resolve( result.slice(comma + 1));
+                };
+                reader.onerror = () => {
+                    reject( reader.error ||new Error("FileReader failed."));
+                };
+                reader.readAsDataURL(blob);
+                }
+            );
+        }
+        async function encryptPart(rawBytes,key,videoId,partIndex){
+            const iv =crypto.getRandomValues(new Uint8Array(12));
+            const additionalData =new TextEncoder().encode(videoId +":part:" +partIndex);
+            const encrypted =await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData,tagLength:128},key,rawBytes);
+            const cipher =new Uint8Array(encrypted);
+            const output =new Uint8Array(HEADER_SIZE +cipher.length);
+            output.set( MAGIC,0 );
+            output[8] = 1;
+            output.set(iv,9);
+            output.set(cipher,HEADER_SIZE);
+            return output;
+        }
+        async function sha256Hex(bytes) {
+            const digest = await crypto.subtle.digest("SHA-256",bytes);
+            return Array.from(new Uint8Array(digest)).map(x =>x.toString(16).padStart(2, "0")).join("");
+        }
+        AWS.config.update({
+            accessKeyId: STORJ_ACCESS_KEY,
+            secretAccessKey: STORJ_SECRET_KEY,
+            region: STORJ_REGION
+        });
+        const s3 = new AWS.S3({
+            endpoint: STORJ_ENDPOINT,
+            s3ForcePathStyle: true,
+            signatureVersion: "v4"
+        });
+        async function uploadToStorj(key, bytes, contentType){
+            checkCancelled();
+            await s3.putObject({
+                Bucket: STORJ_BUCKET,
+                Key: key,
+                Body: bytes,
+                ContentType: contentType
+            }).promise();
+        }
+        function storjURL(key){
+            return (STORJ_ENDPOINT +"/" +STORJ_BUCKET +"/" +key);
+        }
+        async function objectExists(key){
+            try{
+                await s3.headObject({
+                    Bucket: STORJ_BUCKET,
+                    Key: key
+                }).promise();
+                return true;
+            }
+            catch(err){
+                if(err.statusCode === 404 ||err.code === "NotFound"){
+                    return false;
+                }
+                throw err;
+            }
+        }
+        async function toPatchedFFmpegURL(url){
+            const response = await fetch(url);
+            if(!response.ok){
+                throw new Error("تعذر تحميل ffmpeg.js\nHTTP " +response.status);
+            }
+            let source = await response.text();
+            const target = "new URL(e.p+e.u(814),e.b)";
+            if(source.includes(target)){
+                source =source.replace(target,"r.workerLoadURL");
+            }
+            return URL.createObjectURL(new Blob([source],{type:"text/javascript"}));
+        }
+        async function loadFF(){
+            if(ffmpegLoaded){
+                return;
+            }
+            if(!window.crossOriginIsolated){
+                throw new Error("crossOriginIsolated=false.\n\n" ,"تأكد من وجود ملفات Service Worker " );
+            }
+            const ffmpegBase ="https://unpkg.com/" +"@ffmpeg/ffmpeg@0.12.15/dist/umd";
+            const coreBase ="https://unpkg.com/" +"@ffmpeg/core-mt@0.12.10/dist/umd";
+            setStatus("⏳ تحميل FFmpeg JS...");
+            const ffmpegBlobURL = await toPatchedFFmpegURL(ffmpegBase +"/ffmpeg.js");
+            await import(ffmpegBlobURL);
+            if(!window.FFmpegWASM ||!window.FFmpegWASM.FFmpeg){
+                throw new Error("تعذر إنشاء FFmpegWASM.FFmpeg.");
+            }
+            ffmpeg = new window.FFmpegWASM.FFmpeg();
+            ffmpeg.on("log",({message}) => {
+                console.debug("[FFmpeg]",message);
+            });
+            ffmpeg.on("progress",({progress}) => {
+                if(typeof progress ==="number"){
+                    window.ffmpegProgress = progress;
+                }
+            });
+            setStatus("⏳ تحميل FFmpeg Core...\n" +"قد يستغرق ذلك بعض الوقت أول مرة.");
+            await ffmpeg.load({
+                workerLoadURL:await toBlobURL(ffmpegBase +"/814.ffmpeg.js","text/javascript"),
+                coreURL: await toBlobURL(coreBase +"/ffmpeg-core.js","text/javascript"),
+                wasmURL: await toBlobURL(coreBase +"/ffmpeg-core.wasm","application/wasm"),
+                workerURL: await toBlobURL(coreBase +"/ffmpeg-core.worker.js","application/javascript")
+            });
+            ffmpegLoaded = true;
+            setStatus("✅ تم تحميل FFmpeg بنجاح.");
+        }
+        async function extractPart(startSeconds,durationSeconds,outputName){
+            checkCancelled();
+            try{
+                await ffmpeg.deleteFile(outputName);
+            }catch{}
+            const returnCode = await ffmpeg.exec(["-ss",String(startSeconds),"-i",inputName,"-t",String(durationSeconds),"-map","0","-c","copy","-movflags","+faststart","-avoid_negative_ts","make_zero",outputName]);
+            if(returnCode !== 0){
+                throw new Error("FFmpeg فشل في استخراج " +outputName);
+            }
+            const data = await ffmpeg.readFile(outputName);
+            if(!data ||!data.length){
+                throw new Error("الجزء الناتج فارغ.");
+            }
+            return data;
+        }
+        async function startUpload() {
+            try {
+                cancelled = false;
+                $("cancel").disabled = false;
+                $("start").disabled = true;
+                setProgress(0);
+                const uuid = $("uuid").value.trim();
+                if (!isUUID(uuid)) {
+                    throw new Error("UUID غير صحيح.");
+                }
+                const file = $("video").files[0];
+                if (!file) {
+                    throw new Error("اختر فيديو أولاً.");
+                }
+                setStatus("⏳ تحميل FFmpeg...");
+                await loadFF();
+                setStatus("✅ FFmpeg جاهز.");
+                setStatus("⏳ قراءة بيانات الفيديو...");
+                const duration = await getVideoDuration(file);
+                const totalParts = Math.ceil(duration / PART_SECONDS);
+                const videoId = uuid;
+                const salt = new TextEncoder().encode(uuid);
+                const key = await deriveKey(uuid, salt);
+                setStatus( `مدة الفيديو : ${hms(duration)}عدد الأجزاء : ${totalParts}جارى البدء...`);
+                console.log({ duration, totalParts, videoId, salt });
+                setStatus("⏳ تجهيز الفيديو...");
+                inputName = "input" + file.name.substring(file.name.lastIndexOf("."));
+                try {
+                    await ffmpeg.deleteFile(inputName);
+                } catch { }
+                await ffmpeg.writeFile(inputName, await fetchFile(file));
+                setStatus("⏳ استخراج أول جزء...");
+                const manifestParts = [];
+                for (let partIndex = 0; partIndex < totalParts; partIndex++) {
+                    setProgress(((partIndex+1) / totalParts) * 100);
+                    setStatus(`⏳ الجزء ${partIndex + 1} من ${totalParts}`);
+                    const start = partIndex * PART_SECONDS;
+                    const partDuration = Math.min(PART_SECONDS, duration - start);
+                    const outputName = `part${partIndex}.mp4`;
+                    const part = await extractPart(start, partDuration, outputName);
+                    console.log("First Part Size:", human(part.length));
+                    setStatus("✅ تم استخراج أول جزء.\n\nالحجم : " + human(part.length));
+                    setStatus(`🔐 تشفير الجزء ${partIndex + 1}...`);
+                    const encryptedPart = await encryptPart(part, key, videoId, partIndex);
+                    console.log("Encrypted Size:", human(encryptedPart.length));
+                    const partHash = await sha256Hex(encryptedPart);
+                    console.log("SHA256:", partHash);
+                    setStatus(`✅ تم تشفير أول جزء.الحجم قبل التشفير : ${human(part.length)}الحجم بعد التشفير : ${human(encryptedPart.length)}SHA256${partHash}`);
+                    setStatus("☁️ رفع أول جزء إلى Storj...");
+                    const partName = `${videoId}/part${String(partIndex).padStart(4, "0")}.movs`;
+                    if(await objectExists(partName)){
+                        console.log("Skipped:",partName);
+                    }else{
+                        await uploadToStorj(partName,encryptedPart,"application/octet-stream");
+                    }
+                    manifestParts.push({
+                        index: partIndex,
+                        file: partName,
+                        url: storjURL(partName),
+                        size: encryptedPart.length,
+                        sha256: partHash
+                    });
+                    console.log("Uploaded:", storjURL(partName));
+                    setStatus(`✅ تم رفع أول جزء بنجاح.${storjURL(partName)}`);
+                }
+                const manifestInfo = await createManifest({
+                    videoId,
+                    originalName: file.name,
+                    duration,
+                    totalParts,
+                    salt,
+                    parts: manifestParts
+                });
+                setProgress(100);
+                setStatus(`🎉 اكتمل رفع الفيديو بنجاح.Video ID:${videoId}Manifest:${manifestInfo.url}عدد الأجزاء:${totalParts}`);
+            }
+            catch (err) {
+                console.error(err);
+                setStatus(err.message);
+            }
+            finally {
+                $("cancel").disabled = true;
+                $("start").disabled = false;
+            }
+        }
+        async function createManifest(data){
+            const manifest = {
+                version: 1,
+                createdAt: new Date().toISOString(),
+                videoId: data.videoId,
+                originalName: data.originalName,
+                duration: data.duration,
+                totalParts: data.totalParts,
+                salt: Array.from(data.salt),
+                algorithm: "AES-256-GCM",
+                pbkdf2Iterations: PBKDF2_ITERATIONS,
+                partSeconds: PART_SECONDS,
+                magic: "MOVSENC1",
+                parts: data.parts
+            };
+            const json = JSON.stringify(manifest,null,2);
+            const bytes = new TextEncoder().encode(json);
+            const manifestName = `${data.videoId}/manifest.json`;
+            await uploadToStorj(manifestName,bytes,"application/json");
+            console.log("Manifest Uploaded:",storjURL(manifestName));
+            return {manifest,url: storjURL(manifestName)};
+        }
+        function human(bytes){
+            const units = ["B","KB","MB","GB","TB"];
+            let index = 0;
+            let value = bytes;
+            while(value >= 1024 &&index < units.length - 1){
+                value /= 1024;
+                index++;
+            }
+            return (value.toFixed(value >= 100 ? 0 : 2) +" " +units[index]);
+        }
+        function hms(seconds){
+            seconds = Math.floor(seconds);
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return ((h? String(h).padStart(2,"0") + ":": "") +String(m).padStart(2,"0") +":" +String(s).padStart(2,"0"));
+        }
+        function checkCancelled(){
+            if(cancelled){
+                throw new Error("تم إلغاء العملية.");
+            }
+        }
+        async function getVideoDuration(file){
+            return new Promise(
+                (resolve,reject)=>{
+
+                    const video = document.createElement("video");
+                    const objectURL = URL.createObjectURL( file );
+                    video.preload = "metadata";
+
+                    video.onloadedmetadata = () => {
+                        const duration = video.duration;
+                        URL.revokeObjectURL(objectURL);
+                        video.remove();
+                        if(Number.isFinite(duration) &&duration > 0){
+                            resolve(duration);
+                        }else{
+                            reject(new Error("تعذر معرفة مدة الفيديو."));
+                        }
+                    };
+                    video.onerror = () => {
+                        URL.revokeObjectURL(objectURL);
+                        video.remove();
+                        reject(new Error("تعذر قراءة الفيديو."));
+                    };
+                    video.src = objectURL;
+                }
+            );
+        }
+        async function toBlobURL(url,mimeType){
+            const response = await fetch(url);
+            if(!response.ok){
+                throw new Error("تعذر تحميل:\n" +url +"\nHTTP " +response.status);
+            }
+            const buffer = await response.arrayBuffer();
+            return URL.createObjectURL(new Blob([buffer],{type:mimeType}));
+        }
+        async function fetchFile(file){
+            return new Uint8Array( await file.arrayBuffer());
+        }
+        function setProgress(value){
+            $("bar").style.width = Math.max(0,Math.min(100,value)) + "%";
+        }
+        function setStatus(text){
+            $("status").textContent = text;
+        }
+        $("new").onclick =() => {
+            const uuid = crypto.randomUUID();
+            $("uuid").value = uuid;
+            console.log("MOVS UUID:",uuid);
+        };
+        $("start").onclick = startUpload;
+        $("cancel").onclick =() => {
+            cancelled = true;
+            $("cancel").disabled = true;
+            setStatus( "⛔ جارٍ إلغاء العملية...");
+        };
+        window.addEventListener("load", () => {
+            console.log("crossOriginIsolated =",window.crossOriginIsolated);
+            if(!window.crossOriginIsolated){
+                console.warn("crossOriginIsolated=false");
+            }
+        });
+    </script>
 </body>
 </html>
